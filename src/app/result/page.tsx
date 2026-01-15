@@ -13,8 +13,17 @@ type AssessmentRow = {
   created_at: string;
 };
 
+type RoadmapRow = {
+  id: string;
+  user_id: string;
+  assessment_id: string;
+  roadmap: any;
+  created_at: string;
+};
+
+type Plan = "free" | "pro";
+
 function pickTop3(answers: Record<string, string>) {
-  // 아주 단순한 룰 기반(오늘은 AI 대신 “결과 느낌”을 주는 목적)
   const items: string[] = [];
 
   const pension = answers["pension_ready"];
@@ -34,7 +43,6 @@ function pickTop3(answers: Record<string, string>) {
   if (job === "없음")
     items.push("은퇴 후 소득원(파트/자격/프로젝트) 옵션 3개 리스트업");
 
-  // 부족하면 기본 항목으로 채움
   const fallback = [
     "현금흐름(수입/지출) 표 만들기",
     "은퇴 시점/목표 생활비를 수치로 정리하기",
@@ -49,17 +57,14 @@ function monthTasks(answers: Record<string, string>) {
   const tasks: string[] = [];
 
   const pension = answers["pension_ready"];
-  const spend = answers["monthly_spend"];
   const debt = answers["debt"];
   const priority = answers["priority"];
 
   if (pension === "모른다") tasks.push("국민연금 예상연금액 조회 + 캡처 저장");
   tasks.push("최근 30일 지출을 5개 카테고리로 분류(식비/주거/교통/통신/기타)");
-
   if (debt !== "없음")
     tasks.push("대출 목록 정리(금리/잔액/상환방식) → 우선순위 표시");
 
-  // 우선순위에 따른 1개 추가
   if (priority === "보험/건강")
     tasks.push("보험 증권/내역 모아서 ‘중복/공백’ 체크");
   else if (priority === "부채 정리")
@@ -79,7 +84,14 @@ export default function ResultPage() {
   const [loading, setLoading] = useState(true);
   const [email, setEmail] = useState("");
   const [assessment, setAssessment] = useState<AssessmentRow | null>(null);
+
+  const [roadmapRow, setRoadmapRow] = useState<RoadmapRow | null>(null);
+  const [aiLoading, setAiLoading] = useState(false);
+
   const [error, setError] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
+  const [plan, setPlan] = useState<Plan>("free");
 
   useEffect(() => {
     async function load() {
@@ -100,48 +112,137 @@ export default function ResultPage() {
 
       setEmail(userData.user.email ?? "");
 
-      // 🔥 내 최신 진단 1개 가져오기
-      const { data, error: qErr } = await supabase
+      // ✅ 내 플랜 조회 (없으면 free로 생성)
+      const { data: pData, error: pErr } = await supabase
+        .from("profiles")
+        .select("plan")
+        .maybeSingle();
+
+      if (pErr) {
+        // profiles 테이블이 없거나 RLS 문제면 일단 free 처리
+        setPlan("free");
+      } else {
+        if (!pData) {
+          // 최초 사용자면 profiles 생성
+          await supabase
+            .from("profiles")
+            .insert({ user_id: userData.user.id, plan: "free" });
+          setPlan("free");
+        } else {
+          setPlan((pData.plan as Plan) ?? "free");
+        }
+      }
+
+      // 최신 진단 1개
+      const { data: aData, error: aErr } = await supabase
         .from("assessments")
         .select("id,user_id,answers,created_at")
         .order("created_at", { ascending: false })
         .limit(1);
 
-      if (qErr) {
-        setError(qErr.message);
+      if (aErr) {
+        setError(aErr.message);
         setLoading(false);
         return;
       }
 
-      setAssessment((data?.[0] as AssessmentRow) ?? null);
+      const latest = (aData?.[0] as AssessmentRow) ?? null;
+      setAssessment(latest);
+
+      // 이미 만들어진 로드맵이 있으면 가져오기
+      if (latest?.id) {
+        const { data: rData, error: rErr } = await supabase
+          .from("roadmaps")
+          .select("id,user_id,assessment_id,roadmap,created_at")
+          .eq("assessment_id", latest.id)
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (!rErr) setRoadmapRow((rData?.[0] as RoadmapRow) ?? null);
+      }
+
       setLoading(false);
     }
 
     load();
   }, [router]);
 
-  const top3 = useMemo(() => {
-    if (!assessment?.answers) return [];
-    return pickTop3(assessment.answers);
-  }, [assessment]);
-
-  const tasks = useMemo(() => {
-    if (!assessment?.answers) return [];
-    return monthTasks(assessment.answers);
-  }, [assessment]);
+  const top3 = useMemo(
+    () => (assessment?.answers ? pickTop3(assessment.answers) : []),
+    [assessment]
+  );
+  const tasks = useMemo(
+    () => (assessment?.answers ? monthTasks(assessment.answers) : []),
+    [assessment]
+  );
 
   const summary = useMemo(() => {
     if (!assessment?.answers) return "";
     const a = assessment.answers;
-
     const retire = a["retire_year"] ?? "미입력";
     const spend = a["monthly_spend"] ?? "미입력";
     const pension = a["pension_ready"] ?? "미입력";
     const debt = a["debt"] ?? "미입력";
     const priority = a["priority"] ?? "미입력";
-
     return `은퇴 시점: ${retire} · 월지출: ${spend} · 연금 파악: ${pension} · 부채: ${debt} · 우선순위: ${priority}`;
   }, [assessment]);
+
+  async function generateAiRoadmap(mode: "create" | "regenerate") {
+    if (!assessment) return;
+
+    // ✅ 이미 로드맵이 있는데 create(생성) 누르면 막기
+    if (mode === "create" && roadmapRow) {
+      setToast("이미 로드맵이 생성되어 있어요 🙂");
+      return;
+    }
+
+    // ✅ 재생성은 pro 전용
+    if (mode === "regenerate" && plan !== "pro") {
+      setToast("재생성 기능은 유료(Pro) 전용이에요 🙂");
+      return;
+    }
+
+    setAiLoading(true);
+    setToast(null);
+    setError(null);
+
+    try {
+      const resp = await fetch("/api/roadmap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answers: assessment.answers }),
+      });
+
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data?.error ?? "AI 생성 실패");
+
+      const roadmap = data.roadmap;
+
+      // ✅ 저장: 재생성은 새 Row로 계속 저장(히스토리 남김)
+      const { data: saved, error: saveErr } = await supabase
+        .from("roadmaps")
+        .insert({
+          user_id: assessment.user_id,
+          assessment_id: assessment.id,
+          roadmap,
+        })
+        .select("id,user_id,assessment_id,roadmap,created_at")
+        .single();
+
+      if (saveErr) throw saveErr;
+
+      setRoadmapRow(saved as RoadmapRow);
+      setToast(
+        mode === "regenerate"
+          ? "로드맵을 새로 만들었어요! 🔄"
+          : "AI 로드맵 생성 완료! 🎉"
+      );
+    } catch (e: any) {
+      setError(e?.message ?? "오류가 발생했어요.");
+    } finally {
+      setAiLoading(false);
+    }
+  }
 
   if (loading) {
     return (
@@ -158,9 +259,6 @@ export default function ResultPage() {
         <h1 className="text-2xl font-bold">내 진단 결과</h1>
         <Card title="문제가 생겼어요">
           <p className="text-sm text-gray-700">{error}</p>
-          <p className="text-sm text-gray-500 mt-2">
-            (보통 RLS/테이블/로그인 상태 문제일 수 있어요)
-          </p>
         </Card>
         <div className="flex gap-3">
           <Button href="/diagnosis">진단 다시하기</Button>
@@ -198,6 +296,12 @@ export default function ResultPage() {
         로그인: <span className="font-medium">{email}</span>
       </p>
 
+      {toast && (
+        <div className="rounded-2xl border border-emerald-100 bg-emerald-50 p-3 text-sm text-gray-700">
+          {toast}
+        </div>
+      )}
+
       <Card title="요약">
         <p className="text-sm text-gray-700">{summary}</p>
         <p className="text-xs text-gray-500 mt-2">
@@ -205,44 +309,114 @@ export default function ResultPage() {
         </p>
       </Card>
 
-      <Card title="우선순위 TOP 3">
-        <ol className="list-decimal pl-5 text-sm text-gray-700 space-y-1">
-          {top3.map((t) => (
-            <li key={t}>{t}</li>
-          ))}
-        </ol>
-      </Card>
-
-      <Card title="이번 달 할 일 3개">
-        <ul className="list-disc pl-5 text-sm text-gray-700 space-y-1">
-          {tasks.map((t) => (
-            <li key={t}>{t}</li>
-          ))}
-        </ul>
-      </Card>
-
-      <Card title="내가 제출한 답변(확인용)">
-        <div className="text-sm text-gray-700 space-y-1">
-          {Object.entries(assessment.answers).map(([k, v]) => (
-            <div key={k} className="flex gap-2">
-              <span className="text-gray-500 w-40 shrink-0">{k}</span>
-              <span className="font-medium">{v}</span>
-            </div>
-          ))}
-        </div>
-      </Card>
-
       <div className="flex gap-3">
-        <Button href="/diagnosis">진단 다시하기</Button>
-        <Button href="/" variant="ghost">
-          홈으로
+        {/* ✅ 기본 생성 버튼: 로드맵 있으면 비활성화 */}
+        <button
+          onClick={() => generateAiRoadmap("create")}
+          disabled={aiLoading || !!roadmapRow}
+          className="inline-flex items-center justify-center rounded-2xl bg-gray-900 px-4 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:opacity-60"
+        >
+          {aiLoading
+            ? "AI 생성 중..."
+            : roadmapRow
+            ? "이미 생성됨 ✅"
+            : "AI 12개월 로드맵 생성"}
+        </button>
+
+        {/* ✅ 재생성: pro 전용 */}
+        <button
+          onClick={() => generateAiRoadmap("regenerate")}
+          disabled={aiLoading || plan !== "pro"}
+          className="inline-flex items-center justify-center rounded-2xl border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-50 disabled:opacity-60"
+        >
+          {plan === "pro" ? "다시 만들기(유료)" : "다시 만들기 🔒 (유료)"}
+        </button>
+
+        <Button href="/diagnosis" variant="ghost">
+          진단 다시하기
         </Button>
       </div>
 
       <p className="text-xs text-gray-500">
-        * 오늘은 룰 기반(임시) 결과예요. Day4에서 AI가 “12개월 로드맵”을
-        생성하도록 업그레이드할게요.
+        현재 플랜: <span className="font-medium">{plan}</span>
       </p>
+
+      {roadmapRow?.roadmap ? (
+        <Card title="AI 12개월 로드맵">
+          <div className="space-y-3">
+            <div>
+              <div className="text-lg font-bold">
+                {roadmapRow.roadmap.title}
+              </div>
+              <div className="text-sm text-gray-700 mt-1">
+                {roadmapRow.roadmap.summary}
+              </div>
+            </div>
+
+            <div>
+              <div className="text-sm font-semibold">우선순위 TOP5</div>
+              <ul className="list-disc pl-5 text-sm text-gray-700 space-y-1 mt-1">
+                {(roadmapRow.roadmap.top_priorities ?? []).map((p: string) => (
+                  <li key={p}>{p}</li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="space-y-2">
+              {(roadmapRow.roadmap.months ?? []).map((m: any) => (
+                <div
+                  key={m.month}
+                  className="rounded-2xl border border-gray-100 p-3"
+                >
+                  <div className="text-sm font-semibold">
+                    {m.month}개월차 · {m.goal}
+                  </div>
+                  <ul className="list-disc pl-5 text-sm text-gray-700 space-y-1 mt-1">
+                    {(m.tasks ?? []).map((t: string) => (
+                      <li key={t}>{t}</li>
+                    ))}
+                  </ul>
+                  <div className="text-xs text-gray-500 mt-2">
+                    주의: {m.caution}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <p className="text-xs text-gray-500">
+              생성 시간: {new Date(roadmapRow.created_at).toLocaleString()}
+            </p>
+          </div>
+        </Card>
+      ) : (
+        <>
+          <Card title="(임시) 우선순위 TOP 3">
+            <ol className="list-decimal pl-5 text-sm text-gray-700 space-y-1">
+              {top3.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ol>
+          </Card>
+
+          <Card title="(임시) 이번 달 할 일 3개">
+            <ul className="list-disc pl-5 text-sm text-gray-700 space-y-1">
+              {tasks.map((t) => (
+                <li key={t}>{t}</li>
+              ))}
+            </ul>
+          </Card>
+
+          <p className="text-xs text-gray-500">
+            * AI 로드맵을 생성하면 위 임시 결과 대신 AI 로드맵이 표시돼요.
+          </p>
+        </>
+      )}
+
+      <div className="flex gap-3">
+        <Button href="/" variant="ghost">
+          홈으로
+        </Button>
+      </div>
     </div>
   );
 }
